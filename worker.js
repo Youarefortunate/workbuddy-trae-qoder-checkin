@@ -3791,6 +3791,7 @@ async function sendQQ(cfg, text) {
 
 /* ---- 汇总文本 ---- */
 const PLATFORM_LABEL = { trae: 'Trae', wb: 'WorkBuddy', qoder: 'Qoder', minimax: 'MiniMax' };
+const WEEKDAY_CN = '日一二三四五六';
 
 function tally(d) {
   const rs = Array.isArray(d?.results) ? d.results : [];
@@ -3804,42 +3805,68 @@ function tally(d) {
 }
 
 function formatReport(result) {
+  const at = String(result.at || '');
+  const date = at.slice(0, 10), time = at.slice(11, 16);
+  // 用北京时间正午取星期，避免运行环境时区把日期算偏
+  let weekday = '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const d = new Date(date + 'T12:00:00+08:00');
+    if (!isNaN(d)) weekday = ' 周' + WEEKDAY_CN[d.getUTCDay()];
+  }
   const lines = [];
-  const at = String(result.at || '').replace(' +08:00', '');
-  lines.push('📋 签到完成 · ' + (at ? at.slice(5, 16) : ''));
-
-  let anyBad = false;
+  if (result.test) {
+    lines.push('🧪 通知配置测试');
+    lines.push('以下是示例数据，仅验证渠道连通，非真实签到结果');
+    lines.push('');
+  }
+  lines.push('📅 每日签到报告');
+  if (date) lines.push('🕐 ' + date + weekday + ' ' + time + ' · 定时任务自动执行');
+  lines.push('');
+  let okSum = 0, skipSum = 0, badSum = 0, anyBad = false;
   for (const key of ['trae', 'wb', 'qoder', 'minimax']) {
     const d = result[key];
-    const name = PLATFORM_LABEL[key];
     if (!d) continue;
+    const name = PLATFORM_LABEL[key];
     if (d.error) {
-      lines.push(`${name}  ❌ ${String(d.error).slice(0, 90)}`);
       anyBad = true;
+      lines.push('❌ ' + name + ' · 平台执行失败');
+      lines.push('　　' + String(d.error).slice(0, 80));
+      lines.push('');
       continue;
     }
     const t = tally(d);
-    if (!t.total) { lines.push(`${name}  — 没有账号`); continue; }
-    const mark = t.bad ? '⚠️' : '✅';
-    if (t.bad) anyBad = true;
-    // 分子用「已处理」= 新签 + 今日已签；否则全是已签时会显示成 0/1，看着像失败
-    const done = t.ok + t.skip;
-    const extra = [];
-    if (t.ok) extra.push(`新签 ${t.ok}`);
-    if (t.skip) extra.push(`已签 ${t.skip}`);
-    if (t.bad) extra.push(`失败 ${t.bad}`);
-    // 只有「全部是新签」时才不写后缀，其余情况都说明清楚
-    const suffix = extra.length > 1 || t.skip || t.bad ? ' · ' + extra.join(' · ') : '';
-    lines.push(`${name}  ${mark} ${done}/${t.total}${suffix}`);
-    for (const r of (d.results || []).slice(0, 6)) {
-      if (r.state === 'checked' && r.msg) lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60));
-      else if (r.state !== 'checked' && r.state !== 'skipped' && r.msg) {
-        lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60));
-      }
+    okSum += t.ok; skipSum += t.skip; badSum += t.bad;
+    if (!t.total) {
+      lines.push('➖ ' + name + ' · 未添加账号');
+      lines.push('');
+      continue;
     }
-    if ((d.results || []).length > 6) lines.push('   · …还有 ' + (d.results.length - 6) + ' 个');
+    if (t.bad) anyBad = true;
+    const done = t.ok + t.skip;
+    const parts = [];
+    if (t.ok) parts.push('新签 ' + t.ok);
+    if (t.skip) parts.push('已签 ' + t.skip);
+    if (t.bad) parts.push('失败 ' + t.bad);
+    lines.push((t.bad ? '⚠️' : '✅') + ' ' + name + ' · ' + done + '/' + t.total + (parts.length > 1 ? '（' + parts.join('，') + '）' : ''));
+    // 失败账号排前面，收到消息一眼先看到问题
+    const rs = [...(Array.isArray(d.results) ? d.results : [])];
+    rs.sort((a, b) => (a.state === 'checked' ? 1 : 0) - (b.state === 'checked' ? 1 : 0));
+    const shown = rs.slice(0, 8);
+    shown.forEach((r, i) => {
+      const last = i === shown.length - 1 && rs.length <= 8;
+      const failed = r.state !== 'checked' && r.state !== 'skipped' && r.state !== 'already';
+      const msg = String(r.msg || '').trim().slice(0, 50) || (r.state === 'checked' ? '签到成功' : failed ? '失败' : '今日已签');
+      lines.push((last ? '└─ ' : '├─ ') + (failed ? '⚠️ ' : '') + String(r.label || '账号') + '：' + msg);
+    });
+    if (rs.length > 8) lines.push('└─ …还有 ' + (rs.length - 8) + ' 个账号');
+    lines.push('');
   }
-  if (anyBad) lines.push('', '需要处理的部分可以打开控制台看一眼。');
+  const total = okSum + skipSum + badSum;
+  lines.push('──────────────');
+  const bits = ['新签 ' + okSum, '已签 ' + skipSum];
+  if (badSum) bits.push('失败 ' + badSum);
+  lines.push('📊 ' + total + ' 个账号 · ' + bits.join('，'));
+  lines.push(anyBad ? '⚠️ 有失败项，建议打开控制台查看详情' : '🎉 全部完成，明天见');
   return lines.join('\n');
 }
 
@@ -3861,7 +3888,7 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-11-12';
+const BUILD = '2026-11-12.2';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -5333,10 +5360,12 @@ export default {
           return json({ error: '还没有配置通知渠道：先在页面里把 Telegram 或 QQ 机器人填好' }, 400);
         }
         const demo = {
+          test: true,
           at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
           trae: { results: [{ label: '示例账号', state: 'checked', msg: '+50 积分' }] },
           wb: { results: [{ label: '示例主号', state: 'skipped', msg: '今日已完成' }] },
           qoder: { results: [{ label: '示例号', state: 'checked', msg: '领取成功 +100 credits' }] },
+          minimax: { results: [{ label: '示例MiniMax', state: 'already', msg: '今日已签到' }] },
         };
         const r = await notifyRun(env, demo);
         return json({ ...r, channels: Object.keys(ch) });
