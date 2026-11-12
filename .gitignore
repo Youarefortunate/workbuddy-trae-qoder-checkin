@@ -1,6 +1,10 @@
 # 本地 Agent 工作状态与临时片段
 .claude/
 .superpowers/
+.workbuddy/
+
+# 本地设计草稿（超级能力工作流产物，不随仓库分发）
+docs/superpowers/
 
 # 依赖与本地 Worker 缓存
 node_modules/
