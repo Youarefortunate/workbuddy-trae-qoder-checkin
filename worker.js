@@ -2996,6 +2996,11 @@ const MiniMax = (() => {
     return Object.assign(new Error(message), { minimaxSafe: true, state, status });
   }
   function safe(e) { return e?.minimaxSafe ? e : fail('MiniMax 请求或存储失败，请稍后重试。'); }
+  // 登录启动阶段标识：只描述失败环节，不回显上游响应、原始异常、设备码、verifier、令牌或密钥。
+  function phaseFail(phase, e) {
+    const err = e?.minimaxSafe ? e : safe(e);
+    return Object.assign(err, { phase, message: '[阶段:' + phase + '] ' + err.message });
+  }
   const hex = data => Array.from(new Uint8Array(data), b => b.toString(16).padStart(2, '0')).join('');
   const digest = async (value, alg = 'SHA-256') => crypto.subtle.digest(alg, encoder.encode(value));
   const hash = async (value, alg) => hex(await digest(value, alg));
@@ -3029,13 +3034,23 @@ const MiniMax = (() => {
   async function request(url, options = {}, oauth = false) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
+    let phase = 'network';
     try {
-      const response = await fetch(url, { ...options, redirect: 'error', signal: controller.signal });
-      if (!response.ok && !(oauth && response.status === 400)) {
-        throw Object.assign(fail('MiniMax 请求未获确认（HTTP ' + response.status + '）。', [401, 403].includes(response.status) ? 'token_dead' : 'error'), { uncertain: response.status >= 500 });
+      // Workers 不支持 redirect:'error'（构造 Request 即抛 TypeError），改用 manual 并显式拒绝 3xx，
+      // 不自动 follow、不把 POST / Authorization 转发到 Location，也不回显 Location。
+      const response = await fetch(url, { ...options, redirect: 'manual', signal: controller.signal });
+      if (response.status >= 300 && response.status < 400) {
+        throw Object.assign(fail('MiniMax 请求未获确认（意外的重定向）。'), { phase: 'http' });
       }
+      if (!response.ok && !(oauth && response.status === 400)) {
+        throw Object.assign(fail('MiniMax 请求未获确认（HTTP ' + response.status + '）。', [401, 403].includes(response.status) ? 'token_dead' : 'error'), { uncertain: response.status >= 500, phase: 'http' });
+      }
+      phase = 'parse';
       return await response.json();
-    } catch (e) { throw e?.minimaxSafe ? e : Object.assign(safe(e), { uncertain: true }); }
+    } catch (e) {
+      if (e?.minimaxSafe) throw e;
+      throw Object.assign(safe(e), { uncertain: true, phase });
+    }
     finally { clearTimeout(timer); }
   }
   const form = (path, data) => request(ACCOUNT + path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' }, body: new URLSearchParams(data).toString() }, true);
@@ -3090,17 +3105,38 @@ const MiniMax = (() => {
     return { accessToken: doc.access_token, refreshToken: doc.refresh_token ?? previous?.refreshToken, expiresAtMs };
   }
   async function start(env) {
-    const verifier = base64url(random(32));
-    const doc = await form('/oauth2/device/code', { client_id: CLIENT, scope: 'agent.default', audience: 'agent-backend', code_challenge: base64url(new Uint8Array(await digest(verifier))), code_challenge_method: 'S256' });
+    let verifier;
+    try { verifier = base64url(random(32)); }
+    catch { throw phaseFail('pkce'); }
+    let challenge;
+    try { challenge = base64url(new Uint8Array(await digest(verifier))); }
+    catch { throw phaseFail('pkce'); }
+    let doc;
+    try {
+      doc = await form('/oauth2/device/code', { client_id: CLIENT, scope: 'agent.default', audience: 'agent-backend', code_challenge: challenge, code_challenge_method: 'S256' });
+    } catch (e) {
+      if (e?.phase === 'parse') throw phaseFail('parse', e);
+      if (e?.phase === 'network') throw phaseFail('fetch', e);
+      throw e;
+    }
     const custom = !doc.device_code && number(doc.expired_in);
     const code = text(custom ? doc.user_code : doc.device_code), userCode = text(doc.user_code);
     const ttl = doc.expires_in ?? (doc.expired_in >= 1e12 ? (doc.expired_in - Date.now()) / 1000 : doc.expired_in);
     let url;
-    try { url = new URL(doc.verification_uri_complete ?? doc.verification_uri ?? doc.verification_url); } catch { throw fail(); }
-    if (url.protocol !== 'https:' || !['account.minimax.cn', 'agent.minimaxi.com', 'agent.minimax.cn'].includes(url.hostname) || url.username || url.password || url.port || !code || !userCode || !number(ttl) || ttl <= 0) throw fail();
+    try { url = new URL(doc.verification_uri_complete ?? doc.verification_uri ?? doc.verification_url); } catch { throw phaseFail('format', fail()); }
+    if (url.protocol !== 'https:' || !['account.minimax.cn', 'agent.minimaxi.com', 'agent.minimax.cn'].includes(url.hostname) || url.username || url.password || url.port || !code || !userCode || !number(ttl) || ttl <= 0) throw phaseFail('format', fail());
     const interval = Math.max(3000, Math.min(60000, number(doc.interval) && doc.interval > 0 ? doc.interval * (custom ? 1 : 1000) : 5000));
-    const expiresAt = Date.now() + Math.min(ttl, 900) * 1000, nonce = hex(random(16));
-    await put(env, 'login:' + nonce, { verifier, code, custom, interval, expiresAt, nextPollAt: Date.now() + interval, status: 'pending' }, 1200);
+    const expiresAt = Date.now() + Math.min(ttl, 900) * 1000;
+    let sealed, nonce;
+    try {
+      nonce = hex(random(16));
+      sealed = await nvSeal(env, { verifier, code, custom, interval, expiresAt, nextPollAt: Date.now() + interval, status: 'pending' });
+    } catch { throw phaseFail('encrypt'); }
+    try {
+      await kvWrite(env, 'login:' + nonce, () => env.MINIMAX_KV.put('login:' + nonce, sealed, { expirationTtl: 1200 }));
+    } catch (e) {
+      throw phaseFail('kv', e);
+    }
     return { nonce, verificationUrl: url.href, userCode, expiresAt, interval };
   }
   function loginView(s) {

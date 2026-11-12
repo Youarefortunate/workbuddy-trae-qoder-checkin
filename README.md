@@ -232,6 +232,23 @@ curl -O https://你的域名/qq/openid-helper.mjs && node openid-helper.mjs <App
 | MiniMax 响应格式发生变化 | 未确认成功且不累计；保留错误现象，等待协议适配，不要反复强刷 |
 | 一直没有定时运行 | 检查 Cron Trigger，注意 Cloudflare 使用 UTC |
 
+### MiniMax 授权启动失败阶段码
+
+`POST /minimax/api/login/start` 失败时，`error` 字段可能带 `[阶段:xxx]` 前缀，用于定位失败环节。上游返回非 2xx 时仍显示原有 `MiniMax 请求未获确认（HTTP xxx）。`，不加阶段前缀。
+
+| 阶段 | 含义 | 处理建议 |
+| --- | --- | --- |
+| `pkce` | WebCrypto 无法生成 `code_verifier` 或 challenge | 确认 Worker 运行环境支持 `crypto.subtle`；不要复制到其他 isolate 受限的执行环境 |
+| `fetch` | 与 `account.minimax.cn/oauth2/device/code` 建连失败或 20 秒超时 | 稍后重试；结合 Cloudflare Logs 关注 Worker 出口是否被风控 |
+| `parse` | 上游返回非 JSON 或空 body | 常见于网关劫持或风控页，稍后重试 |
+| `format` | 上游 200 JSON 但缺 `device_code` / `user_code` / `verification_uri`，或 URL 不是 https、域名不在白名单 | MiniMax 协议变化，等待适配，不要反复强刷 |
+| `encrypt` | 加密 login 会话失败，通常是 `MASTER_KEY` 缺失或非 32 字节 base64 | 核对 Secret 名字与值；切勿更换 `MASTER_KEY` |
+| `kv` | 写入 `MINIMAX_KV` 失败（含 429 退避耗尽） | 检查 KV 绑定名是否为 `KV`，观察是否触发同键限速 |
+
+阶段标识只描述失败环节，不回显原始异常、上游响应正文、设备码、`code_verifier`、令牌或密钥。向维护者反馈时，请附上阶段码与 UTC 时间戳，不要截图凭据。
+
+**重定向与 `[阶段:fetch]`**：早期版本对 MiniMax 请求使用 `redirect: 'error'`，但 Cloudflare Workers 不支持该模式（构造 `Request` 时即抛 `TypeError`），上游即使返回 200 也会落到 `[阶段:fetch]`。现改为 `redirect: 'manual'` 并显式拒绝所有 300–399 响应：不自动 follow，不向 `Location` 转发 POST / `Authorization`，错误为静态文案且不回显 `Location`；其余 HTTP / JSON / 超时 / `uncertain` / 状态语义保持不变。
+
 排障可查看 Worker 的 **Logs**，但不要记录或公开令牌、密钥、设备码等敏感信息。Qoder 可使用 `GET /qoder/api/inspect?id=<账号id>` 查看诊断。
 
 ---
